@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Session Markdown Export",
+    "description": "Exports a session and its whole subagent fleet to two Markdown files: a readable narrative summary and a complete raw archive."
+  }
+}

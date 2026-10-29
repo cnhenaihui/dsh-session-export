@@ -1,0 +1,18 @@
+# 依赖与缓存
+node_modules/
+.npm-cache/
+
+# 日志
+*.log
+
+# 备份文件
+*.bak
+
+# 导出产物（本地生成，不入库）
+exports/
+export-test/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+desktop.ini

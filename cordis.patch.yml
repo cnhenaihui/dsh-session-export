@@ -1,0 +1,3 @@
+- insert:
+    - id: session-md-export
+      name: '@local/dsh-session-export'
