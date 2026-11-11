@@ -20,11 +20,14 @@ import { renderSummary } from './lib/render-summary.js'
 import {
   bareSessionId,
   byteLength,
+  canWriteDir,
   cleanTitle,
+  compareKey,
   fnv1a,
   formatDateTime,
   humanBytes,
   slugify,
+  writableRoot,
 } from './lib/util.js'
 
 export const name = 'session-md-export'
@@ -95,8 +98,12 @@ async function writeTextFile(ctx, absolutePath, content, context) {
  * write is attempted directly; some backends create missing parents, others
  * fail loudly with ENOENT — in which case we retry once by compiling nothing
  * and surfacing a precise instruction instead of a stack trace.
+ *
+ * `fallbackDir` is used only for a sandbox denial: the caller has already
+ * decided that writing somewhere readable beats failing outright, so the pair
+ * is retried there once (never recursively).
  */
-async function writePair(ctx, dirAbsolute, files, context) {
+async function writePair(ctx, dirAbsolute, files, context, fallbackDir) {
   const written = []
   const policy = resolveWritePolicy(ctx, context?.agent)
   for (const file of files) {
@@ -105,18 +112,24 @@ async function writePair(ctx, dirAbsolute, files, context) {
       written.push(file)
     } catch (error) {
       const message = error?.message ?? String(error)
-      const diagnosis = `[mode=${policy?.mode ?? 'unknown'}, workspaceRoot=${policy?.workspaceRoot ?? 'unknown'}]`
-      const hint = message.includes('file access denied')
-        ? `写入 ${file.name} 被沙箱拒绝：${message} ${diagnosis}。当前会话的文件策略不允许写该路径，请把导出目录改到会话工作区内。`
+      const denied = message.includes('file access denied')
+      if (denied && fallbackDir && compareKey(fallbackDir) !== compareKey(dirAbsolute)) {
+        const retried = await writePair(ctx, fallbackDir, files, context, undefined)
+        return { ...retried, fellBackFrom: dirAbsolute }
+      }
+      const mode = policy?.mode ?? 'unknown'
+      const root = policy?.workspaceRoot ?? '未知'
+      const hint = denied
+        ? `保存位置 ${dirAbsolute} 不在当前会话的可写范围（文件策略 ${mode}，可写根 ${root}），无法写入 ${file.name}。请改选工作区内的目录，或把会话的文件策略切到 danger-full-access。`
         : error?.code === 'ENOENT'
-          ? `输出目录 ${dirAbsolute} 不存在。请先创建该目录，或把 outputDir 指向已存在的目录。`
-          : `写入 ${file.name} 失败：${message} ${diagnosis}`
+          ? `输出目录 ${dirAbsolute} 不存在，且无法自动创建。请先创建该目录，或把 outputDir 指向已存在的目录。`
+          : `写入 ${file.name} 失败：${message}`
       const failure = new Error(hint)
       failure.writtenBefore = written.map((f) => f.name)
       throw failure
     }
   }
-  return written
+  return { written, dir: dirAbsolute }
 }
 
 /**
@@ -208,7 +221,13 @@ async function askUserForDirectory(ctx, { agent, signal, cwd }) {
   }
 
   const home = homeDirectory()
-  const quick = [
+  const policy = resolveWritePolicy(ctx, agent)
+  const root = writableRoot(policy)
+  // Offering a location the sandbox will reject is worse than offering fewer
+  // locations: the export then fails after the (slow) render. Under
+  // `workspace-write` the desktop and the documents folder are both outside the
+  // writable root, so they are only offered when the policy really allows them.
+  const candidates = [
     { label: '工作区 exports 目录', path: `${cwd.replace(/[\\/]+$/, '')}/exports`, note: '默认位置' },
     ...(home
       ? [
@@ -217,6 +236,11 @@ async function askUserForDirectory(ctx, { agent, signal, cwd }) {
         ]
       : []),
   ]
+  const quick = candidates.filter((entry) => canWriteDir(entry.path, policy))
+  const blocked = candidates.filter((entry) => !canWriteDir(entry.path, policy))
+  const policyNote = blocked.length > 0
+    ? `当前文件策略是 ${policy?.mode ?? 'unknown'}，只有工作区内可写；桌面/文档需要把文件策略切到 danger-full-access（或直接填写工作区内的绝对路径）。`
+    : '可选下面的常用位置，或直接在输入框里填写绝对路径（如 D:\\会话导出）。目录不存在会自动创建。'
 
   let answer
   try {
@@ -229,8 +253,7 @@ async function askUserForDirectory(ctx, { agent, signal, cwd }) {
           id: 'export-dir',
           header: '保存位置',
           question: '把导出文件保存到哪里？',
-          detail:
-            '可选下面的常用位置，或直接在输入框里填写绝对路径（如 D:\\会话导出）。目录不存在会自动创建。',
+          detail: policyNote,
           options: quick.map((o) => ({ label: o.label, description: `${o.note} · ${o.path}` })),
           multiSelect: false,
         },
@@ -365,9 +388,33 @@ async function runExport(ctx, request, context = {}) {
 
   const digest = fnv1a(`${exportId}|${summaryText ?? ''}|${rawText ?? ''}`)
 
-  // 3. Write.
-  const dirAbsolute = resolveOutputDir(cwd, options.outputDir)
-  const written = await writePair(ctx, dirAbsolute, pending, context)
+  // 3. Write. The destination is settled before the disk is touched: a path
+  //    outside the session's writable roots fails identically every time, and
+  //    rendering this tree is the expensive half of the job, so a caller that
+  //    points at the desktop (a very natural choice) is steered to the
+  //    workspace instead of being made to wait for a guaranteed failure.
+  const policy = resolveWritePolicy(ctx, context.agent)
+  const requestedDir = resolveOutputDir(cwd, options.outputDir)
+  const fallbackDir = resolveOutputDir(cwd, DEFAULTS.outputDir)
+  const notes = []
+  let dirAbsolute = requestedDir
+  let fallbackFrom = null
+  if (!canWriteDir(requestedDir, policy)) {
+    dirAbsolute = fallbackDir
+    fallbackFrom = requestedDir
+    notes.push(
+      `目标目录 ${requestedDir} 不在当前会话的可写范围（文件策略 ${policy?.mode ?? 'unknown'}），` +
+        `已改存到 ${fallbackDir}。如需写到该目录，请把会话的文件策略切到 danger-full-access。`,
+    )
+  }
+
+  const writeResult = await writePair(ctx, dirAbsolute, pending, context, fallbackDir)
+  const written = writeResult.written
+  if (writeResult.fellBackFrom) {
+    fallbackFrom = writeResult.fellBackFrom
+    notes.push(`目标目录 ${writeResult.fellBackFrom} 写入被拒绝，已改存到 ${writeResult.dir}。`)
+  }
+  dirAbsolute = writeResult.dir
 
   return {
     ok: true,
@@ -377,7 +424,8 @@ async function runExport(ctx, request, context = {}) {
     rootSession: snapshot.rootBare,
     sessionCount: snapshot.coverage.sessionCount,
     eventCount: snapshot.coverage.totalEvents,
-    warnings: snapshot.warnings,
+    warnings: [...snapshot.warnings, ...notes],
+    fallbackFrom,
     outputDir: dirAbsolute,
     files: written.map((file) => ({
       name: file.name,
@@ -406,6 +454,12 @@ function formatReceipt(result) {
   }
   lines.push('')
   lines.push(`目录：\`${result.outputDir}\``)
+  // Say the destination moved up front: a receipt whose first line still reads
+  // "exported" while the files went somewhere else is how a user ends up hunting
+  // for a folder that never received them.
+  if (result.fallbackFrom) {
+    lines.push(`> 原定位置 \`${result.fallbackFrom}\` 不在当前会话可写范围内，已改存到上面的目录。`)
+  }
   if (result.warnings.length > 0) {
     lines.push('')
     lines.push(`⚠️ ${result.warnings.length} 条提示：`)

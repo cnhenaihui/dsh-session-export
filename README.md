@@ -57,6 +57,16 @@ export_session_markdown({ sessionId?: string, ... })
 
 指定了 `outputDir` 就完全不打扰；用户取消则**一个文件都不写**（询问发生在渲染之前）。
 
+**保存位置必须落在会话可写范围内**
+
+DSH 的会话文件策略默认是 `workspace-write`：只有会话工作区（如 `…\DSHworkSpace`）可写，**桌面、文档、其它盘符都会被沙箱拒绝**。所以：
+
+- 「工作区 exports 目录」永远是安全选项；想存到桌面/文档，需要把会话的文件策略切到 `danger-full-access`
+- 选位置的快捷项会**先按当前策略过滤**，不会再给出注定失败的选项
+- 即便如此选到了不可写的位置，也**不会失败**：导出会改存到 `<工作区>/exports`，回执里明确写「原定位置 X 不在可写范围，已改存到 Y」。渲染发生在写盘之前，判定也提前做，所以不会白跑一遍渲染
+
+> 踩过的坑：会话标题是 `本地插件：技能管理插件维护` 时，文件名曾原样带上全角冒号 `：`（NTFS 允许，但 zip/同步/SMB 工具会出问题），现在 `slugify` 会把半角与全角路径字符一起折叠成 `-`，并处理 `CON`/`NUL` 这类 Windows 保留名。
+
 子代理无法回答提问（DSH 只允许 live runtime root 接收人类回答），所以由子代理触发的导出会直接走默认目录，不会挂住。
 
 **路径解析用 `path.resolve`，不手写前缀判断**
@@ -100,6 +110,7 @@ DSH 会把 harness 上下文（runtime context、技能清单、时间采样、�
 - 旧格式会话若无法重放（`migration-required`），会降级为「仅元数据」并在文件中标注，不会中断导出。
 - 无法读取的子代理分支（外部/不可用）会在「导出提示」里列出，不会静默缺失。
 - 超长会话的 raw 会很大（几百 turn 可能几十 MB）；可用 `formats: ["summary"]` 只出摘要。
+- **`workspace-write` 下写不到工作区之外**（这是 DSH 的安全边界，不是本插件的限制）：选到桌面/文档时不再报错失败，而是改存到 `<工作区>/exports` 并在回执里说明原定位置。要真的写到别处，把会话的文件策略切到 `danger-full-access`。
 
 ## 文件构成
 
@@ -110,7 +121,7 @@ lib/collect.js        定位根会话、自建编队树、逐会话冻结快照
 lib/render-summary.js 叙事渲染
 lib/render-raw.js     原始存档渲染
 lib/redact.js         脱敏规则
-lib/util.js           会话 ID 归一化、时间格式、转义、截断
+lib/util.js           会话 ID 归一化、时间格式、转义、截断、可写性判定（`canWriteDir`）
 test/render-test.mjs  离线渲染测试（直接读磁盘上的 v4 日志，无需安装）
 test/client-test.mjs  Client 半边离线测试（桩 React / ModuleLoader / 严格 ctx）
 test/host-test.mjs    路径解析表驱动测试

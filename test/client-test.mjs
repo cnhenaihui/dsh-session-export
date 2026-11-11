@@ -61,7 +61,7 @@ let moduleExports = null
 globalThis.window = {
   __ModuleLoader__: {
     load({ id, factory }) {
-      check('bundle id equals the package name', id === '@local/dsh-session-export', id)
+      check('bundle id equals the package name', id === '@cnhenaihui/dsh-session-export', id)
       moduleExports = factory((spec) => {
         if (spec === 'react') return React
         throw new Error(`unexpected require("${spec}")`)

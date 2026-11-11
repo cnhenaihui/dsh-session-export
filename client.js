@@ -1,5 +1,5 @@
 window.__ModuleLoader__.load({
-  id: '@local/dsh-session-export',
+  id: '@cnhenaihui/dsh-session-export',
   factory(require) {
     const React = require('react')
     const h = React.createElement

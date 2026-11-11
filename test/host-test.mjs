@@ -17,6 +17,8 @@ import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import { resolve as resolvePath, sep } from 'node:path'
 
+import { canWriteDir, slugify } from '../lib/util.js'
+
 const here = dirname(fileURLToPath(import.meta.url))
 const source = readFileSync(join(here, '..', 'index.js'), 'utf8')
 
@@ -91,10 +93,61 @@ if (isWindows && regression.includes('ws/D:')) {
   console.log('  ok   no workspace-prefixed absolute path')
 }
 
+/**
+ * Writability, which drives the "save to the workspace instead of failing"
+ * fallback. Every case here is a shape the sandbox reports on this platform.
+ */
+const policyCases = [
+  ['workspace-write allows the workspace itself', CWD, { mode: 'workspace-write', workspaceRoot: CWD }, true],
+  ['workspace-write allows a child', `${CWD}\\exports`, { mode: 'workspace-write', workspaceRoot: CWD }, true],
+  ['workspace-write rejects a sibling', `${CWD}-other\\exports`, { mode: 'workspace-write', workspaceRoot: CWD }, false],
+  ['workspace-write rejects the desktop', 'C:\\Users\\me\\Desktop', { mode: 'workspace-write', workspaceRoot: CWD }, false],
+  ['trailing separators do not break containment', `${CWD}\\exports\\`, { mode: 'workspace-write', workspaceRoot: `${CWD}\\` }, true],
+  ['case differences do not break containment', 'c:\\USERS\\me\\ws\\out', { mode: 'workspace-write', workspaceRoot: 'C:\\Users\\me\\ws' }, true],
+  ['danger-full-access allows anything', 'D:\\随便\\哪', { mode: 'danger-full-access' }, true],
+  ['an unknown mode is not pre-judged', 'D:\\out', { mode: 'something-new', workspaceRoot: CWD }, true],
+  ['a missing policy is not pre-judged', 'D:\\out', undefined, true],
+  ['read-only without a root is not pre-judged', 'D:\\out', { mode: 'read-only' }, true],
+]
+
+for (const [label, dir, policy, expected] of policyCases) {
+  const actual = canWriteDir(dir, policy)
+  if (actual === expected) {
+    console.log(`  ok   ${label}`)
+  } else {
+    failures += 1
+    console.log(`  FAIL ${label}\n         dir      ${JSON.stringify(dir)}\n         expected ${expected}\n         actual   ${actual}`)
+  }
+}
+
+/**
+ * File-name slugs. A session titled `本地插件：技能管理插件维护` used to produce
+ * `本地插件：技能管理插件维护_….summary.md`, and the full-width colon is hostile
+ * to zip/tooling even where NTFS allows it.
+ */
+const slugCases = [
+  ['full-width colon is folded', '本地插件：技能管理插件维护', '本地插件-技能管理插件维护'],
+  ['half-width path characters are folded', 'a/b:c*d?e"f<g>h|i', 'a-b-c-d-e-f-g-h-i'],
+  ['a reserved device name is made safe', 'CON', 'CON-export'],
+  ['blank input falls back', '   ', 'session'],
+  ['trailing dots are trimmed', 'trailing dots...', 'trailing-dots'],
+]
+
+for (const [label, input, expected] of slugCases) {
+  const actual = slugify(input)
+  if (actual === expected) {
+    console.log(`  ok   ${label}`)
+  } else {
+    failures += 1
+    console.log(`  FAIL ${label}\n         input    ${JSON.stringify(input)}\n         expected ${JSON.stringify(expected)}\n         actual   ${JSON.stringify(actual)}`)
+  }
+}
+
+const total = cases.length + 1 + policyCases.length + slugCases.length
 console.log()
 if (failures === 0) {
-  console.log(`all ${cases.length + 1} host path checks passed`)
+  console.log(`all ${total} host checks passed`)
 } else {
-  console.log(`${failures} host path check(s) failed`)
+  console.log(`${failures} host check(s) failed`)
   process.exitCode = 1
 }

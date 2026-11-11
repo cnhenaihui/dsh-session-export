@@ -1,9 +1,33 @@
 {
-  "name": "@local/dsh-session-export",
+  "name": "@cnhenaihui/dsh-session-export",
   "version": "0.3.0",
-  "private": true,
   "type": "module",
-  "description": "Export a DSH session tree (lead + subagent fleet) to two Markdown files: a readable narrative summary and a complete raw archive.",
+  "description": "Export a DSH session tree (lead + subagent fleet) to two Markdown files from one frozen snapshot: a readable narrative summary and a complete raw archive. / 把一次会话及其整个智能体编队从同一份冻结快照导出为两份 Markdown：可读的叙事摘要与完整的原始存档。",
+  "license": "MIT",
+  "author": "cnhenaihui",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cnhenaihui/dsh-session-export.git"
+  },
+  "bugs": {
+    "url": "https://github.com/cnhenaihui/dsh-session-export/issues"
+  },
+  "homepage": "https://github.com/cnhenaihui/dsh-session-export#readme",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "deepseek",
+    "cordis",
+    "session",
+    "export",
+    "markdown",
+    "transcript",
+    "archive"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
@@ -18,8 +42,13 @@
     "lib/*.js",
     "cordis.patch.yml",
     "locale/*.json",
-    "icon.svg"
+    "icon.svg",
+    "README.md",
+    "LICENSE"
   ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
