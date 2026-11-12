@@ -58,17 +58,34 @@ const React = {
 let registration = null
 let moduleExports = null
 
+/**
+ * `react-dom` is a seeded module in the real shell, so the bundle may require
+ * it. The stub records portal calls instead of touching a DOM.
+ */
+const portalCalls = []
+const ReactDOM = {
+  createPortal(node, container) {
+    portalCalls.push({ node, container })
+    return { __portal: true, node, container }
+  },
+}
+
 globalThis.window = {
   __ModuleLoader__: {
     load({ id, factory }) {
       check('bundle id equals the package name', id === '@cnhenaihui/dsh-session-export', id)
       moduleExports = factory((spec) => {
         if (spec === 'react') return React
+        if (spec === 'react-dom') return ReactDOM
         throw new Error(`unexpected require("${spec}")`)
       })
     },
   },
+  innerHeight: 900,
 }
+
+// The portal target: `createPortal(..., document.body)`.
+globalThis.document = { body: { __isBody: true } }
 
 // --- the cordis context the plugin will receive ------------------------------
 const executed = []
@@ -106,10 +123,48 @@ const commandsService = {
 }
 
 const pickerCalls = []
+const listingCalls = []
+
+/** One fake Host filesystem level, keyed by directory path. */
+const LISTINGS = {
+  'C:\\Users\\me\\ws': {
+    path: 'C:\\Users\\me\\ws',
+    home: 'C:\\Users\\me',
+    crumbs: [
+      { name: 'C:', path: 'C:\\', hidden: false },
+      { name: 'ws', path: 'C:\\Users\\me\\ws', hidden: false },
+    ],
+    entries: [
+      { name: 'exports', path: 'C:\\Users\\me\\ws\\exports', hidden: false },
+      { name: '归档', path: 'C:\\Users\\me\\ws\\归档', hidden: false },
+    ],
+    truncated: false,
+  },
+  'C:\\Users\\me\\ws\\归档': {
+    path: 'C:\\Users\\me\\ws\\归档',
+    home: 'C:\\Users\\me',
+    crumbs: [
+      { name: 'C:', path: 'C:\\', hidden: false },
+      { name: 'ws', path: 'C:\\Users\\me\\ws', hidden: false },
+      { name: '归档', path: 'C:\\Users\\me\\ws\\归档', hidden: false },
+    ],
+    entries: [],
+    truncated: false,
+  },
+}
+
 const uiWorkspace = {
   async pickDirectory() {
     pickerCalls.push('workspace')
-    return 'D:\\会话导出'
+    // Mirrors the browse-only Host picker, which refuses native picks.
+    throw new Error('directoryPicker.pick needs the native capability; the composed picker serves "browse"')
+  },
+  async listDirectory(target) {
+    listingCalls.push(target)
+    const key = target ?? 'C:\\Users\\me\\ws'
+    const listing = LISTINGS[key]
+    if (!listing) throw new Error(`cannot list "${key}"`)
+    return listing
   },
 }
 
@@ -120,6 +175,17 @@ const uiWorkspace = {
  * next to the button, so the stub has to be strict for the suite to catch it.
  */
 const services = { locale, uiWorkspace, 'remote.commands': commandsService }
+
+/**
+ * `sessions.scope(id)` exposes the session's working directory; the browser uses
+ * it as its first level instead of the Host home.
+ */
+const sessions = {
+  scope() {
+    return { cwd: 'C:\\Users\\me\\ws' }
+  },
+}
+services.sessions = sessions
 const rawCtx = {
   get(key) {
     return services[key]
@@ -156,6 +222,31 @@ const ctx = new Proxy(rawCtx, {
 console.log('client bundle')
 eval(source)
 check('factory returned a plugin', moduleExports != null && typeof moduleExports.apply === 'function')
+
+/**
+ * The in-app browser is an anonymous function component, so it is identified by
+ * the props it receives rather than by identity. `onNavigate` + `onCommit` +
+ * `onClose` only exist on that node.
+ */
+const isBrowserNode = (node) =>
+  node != null &&
+  typeof node === 'object' &&
+  typeof node.props?.onNavigate === 'function' &&
+  typeof node.props?.onCommit === 'function' &&
+  typeof node.props?.onClose === 'function'
+
+/** Find the browser node anywhere in a rendered tree, including through a portal. */
+const findBrowser = (node) => {
+  if (node == null || typeof node !== 'object') return null
+  // A portal wrapper produced by the react-dom stub.
+  if (node.__portal) return findBrowser(node.node)
+  if (isBrowserNode(node)) return node
+  for (const child of node.children ?? []) {
+    const found = findBrowser(child)
+    if (found) return found
+  }
+  return null
+}
 
 const inject = moduleExports.inject ?? []
 console.log('  inject:', JSON.stringify(inject))
@@ -222,59 +313,129 @@ const click = button.props.onClick
 check('button exposes onClick', typeof click === 'function')
 
 const run = async () => {
-  await click()
-  check('asked the picker once', pickerCalls.length === 1, JSON.stringify(pickerCalls))
-  check('executed one command', executed.length === 1, JSON.stringify(executed))
-  const call = executed[0]
-  check('addressed the right session', call?.sessionId === 'session-abc', call?.sessionId)
-  check('used the md-export command', call?.line === '/md-export D:\\会话导出', call?.line)
-  check('passed an attachments array', Array.isArray(call?.attachments) && call.attachments.length === 0)
-
-  // Cancelling the dialog must not run any command.
-  pickerCalls.length = 0
-  executed.length = 0
-  uiWorkspace.pickDirectory = async () => {
-    pickerCalls.push('workspace')
-    return null
+  /** Render the registered component and return the button node. */
+  const render = () => {
+    stateCursor = 0
+    return registration.component({ sessionId: 'session-abc' })
   }
-  stateCursor = 0
-  const second = registration.component({ sessionId: 'session-abc' })
-  const secondButton = second.children.find((child) => child?.type === 'button')
-  await secondButton.props.onClick()
-  check('cancel runs no command', executed.length === 0, JSON.stringify(executed))
+  const mount = () => render().children.find((child) => child?.type === 'button')
 
-  // No picker at all must surface a note, not throw.
-  uiWorkspace.pickDirectory = undefined
-  const savedBridge = globalThis.__DSH_DESKTOP_PICK_DIRECTORY__
+  /** The in-app browser currently in the tree, or null. */
+  const browserState = () => {
+    const node = findBrowser(render())
+    return node ? node.props.state : null
+  }
+  const browserNavigate = async (target) => {
+    const node = findBrowser(render())
+    if (!node) throw new Error('no browser rendered')
+    await node.props.onNavigate(target)
+  }
+  const browserCommit = () => {
+    const node = findBrowser(render())
+    if (!node) throw new Error('no browser rendered')
+    node.props.onCommit()
+  }
+  /** Let queued promise continuations run. */
+  const flush = () => new Promise((resolve) => setTimeout(resolve, 0))
+
+  // --- path 1: a real OS dialog exists and succeeds -------------------------
+  globalThis.__DSH_DESKTOP_PICK_DIRECTORY__ = async () => 'D:\\会话导出'
+  executed.length = 0
+  await mount().props.onClick()
+  check('bridge pick executes one command', executed.length === 1, JSON.stringify(executed))
+  check(
+    'bridge pick passes the chosen directory',
+    executed[0]?.line === '/md-export D:\\会话导出',
+    executed[0]?.line,
+  )
+  check('bridge pick addresses the right session', executed[0]?.sessionId === 'session-abc', executed[0]?.sessionId)
+  check(
+    'bridge pick passes an attachments array',
+    Array.isArray(executed[0]?.attachments) && executed[0].attachments.length === 0,
+  )
   delete globalThis.__DSH_DESKTOP_PICK_DIRECTORY__
-  pickerCalls.length = 0
-  stateCursor = 0
-  const third = registration.component({ sessionId: 'session-abc' })
-  const thirdButton = third.children.find((child) => child?.type === 'button')
-  await thirdButton.props.onClick()
-  check('missing picker runs no command', executed.length === 0)
-  if (savedBridge !== undefined) globalThis.__DSH_DESKTOP_PICK_DIRECTORY__ = savedBridge
 
-  // A handler error must be surfaced as a note.
-  pickerCalls.length = 0
-  uiWorkspace.pickDirectory = async () => 'D:\\x'
+  // --- path 2: browse-only Host picker falls back to the in-app browser -----
+  executed.length = 0
+  listingCalls.length = 0
+  await mount().props.onClick()
+  check('browse-only picker falls back instead of erroring', listingCalls.length === 1, JSON.stringify(listingCalls))
+  // The browser must not start at the Host home: on Windows that level usually
+  // contains junctions the Host cannot `opendir`, failing the whole listing.
+  check(
+    'browser starts at the session working directory',
+    listingCalls[0] === 'C:\\Users\\me\\ws',
+    JSON.stringify(listingCalls),
+  )
+  check('fallback runs no export yet', executed.length === 0, JSON.stringify(executed))
+  check('fallback opened the in-app browser', browserState() !== null)
+  // This build's dock slot docs require fixed overlays to portal out of the
+  // scrolling composer, so the browser must render into document.body.
+  check('browser portals out of the composer', portalCalls.length > 0, `${portalCalls.length} portal call(s)`)
+  check(
+    'browser portals into document.body',
+    portalCalls.at(-1)?.container === globalThis.document.body,
+    JSON.stringify(portalCalls.at(-1)?.container),
+  )
+  check(
+    'fallback shows no picker complaint',
+    !stateSlots.some((value) => typeof value === 'string' && value.includes('native capability')),
+    JSON.stringify(stateSlots.filter((v) => typeof v === 'string')),
+  )
+
+  // Walking into a folder and committing it exports to that folder.
+  await browserNavigate('C:\\Users\\me\\ws\\归档')
+  check('navigated into a child folder', browserState()?.listing?.path === 'C:\\Users\\me\\ws\\归档')
+  browserCommit()
+  await flush()
+  check('commit runs one export', executed.length === 1, JSON.stringify(executed))
+  check(
+    'commit exports into the browsed folder',
+    executed[0]?.line === '/md-export C:\\Users\\me\\ws\\归档',
+    executed[0]?.line,
+  )
+  check('commit closes the browser', browserState() === null)
+
+  // --- path 3: no picker service at all ------------------------------------
+  executed.length = 0
+  const savedList = uiWorkspace.listDirectory
+  const savedPick = uiWorkspace.pickDirectory
+  delete uiWorkspace.listDirectory
+  delete uiWorkspace.pickDirectory
+  stateSlots.length = 0
+  await mount().props.onClick()
+  check('no picker service runs no export', executed.length === 0, JSON.stringify(executed))
+  check(
+    'no picker service explains itself',
+    stateSlots.some((value) => typeof value === 'string' && value.includes('目录选择')),
+    JSON.stringify(stateSlots.filter((v) => typeof v === 'string')),
+  )
+  uiWorkspace.listDirectory = savedList
+  uiWorkspace.pickDirectory = savedPick
+
+  // --- a handler error must be surfaced as a note --------------------------
+  globalThis.__DSH_DESKTOP_PICK_DIRECTORY__ = async () => 'D:\\x'
   commandsResult.value = { result: { kind: 'error', text: '导出失败：磁盘已满' } }
-  stateCursor = 0
-  const fourth = registration.component({ sessionId: 'session-abc' })
-  const fourthButton = fourth.children.find((child) => child?.type === 'button')
-  await fourthButton.props.onClick()
+  stateSlots.length = 0
+  await mount().props.onClick()
   check('handler error becomes a note', stateSlots.some((value) => value === '导出失败：磁盘已满'))
+  delete globalThis.__DSH_DESKTOP_PICK_DIRECTORY__
+  commandsResult.value = { result: { kind: 'success', text: 'done' } }
 
-  // Without a command channel the click must explain itself, not throw.
-  pickerCalls.length = 0
+  // Cancelling the OS dialog must not run any command.
+  globalThis.__DSH_DESKTOP_PICK_DIRECTORY__ = async () => null
+  executed.length = 0
+  await mount().props.onClick()
+  check('cancel runs no command', executed.length === 0, JSON.stringify(executed))
+  delete globalThis.__DSH_DESKTOP_PICK_DIRECTORY__
+
+  // --- a missing command channel explains itself ---------------------------
   executed.length = 0
   stateSlots.length = 0
   const savedCommandsService = services['remote.commands']
   delete services['remote.commands']
-  stateCursor = 0
-  const fifth = registration.component({ sessionId: 'session-abc' })
-  const fifthButton = fifth.children.find((child) => child?.type === 'button')
-  await fifthButton.props.onClick()
+  globalThis.__DSH_DESKTOP_PICK_DIRECTORY__ = async () => 'D:\\y'
+  await mount().props.onClick()
   check('missing command channel runs nothing', executed.length === 0)
   check(
     'missing command channel explains itself',
@@ -282,9 +443,9 @@ const run = async () => {
     JSON.stringify(stateSlots.filter((v) => typeof v === 'string')),
   )
   services['remote.commands'] = savedCommandsService
+  delete globalThis.__DSH_DESKTOP_PICK_DIRECTORY__
 
-  // The bug the strict proxy exists to catch: a `?? ctx.remote` fallback turns a
-  // missing service into a thrown error instead of a handled absence.
+  // --- the strictness checks the earlier bugs taught us --------------------
   {
     const savedLocale = services.locale
     delete services.locale
@@ -295,16 +456,10 @@ const run = async () => {
     } catch (error) {
       threw = error
     }
-    check(
-      'renders with no locale service',
-      threw === null,
-      threw?.message,
-    )
+    check('renders with no locale service', threw === null, threw?.message)
     services.locale = savedLocale
   }
 
-  // Absent `remote.commands` must not be reached through bare property access
-  // either — the flat name has no `remote` parent to walk through.
   {
     delete services['remote.commands']
     // A `remote` object exists here only to prove the component never reaches
@@ -312,6 +467,7 @@ const run = async () => {
     services.remote = {}
     let touched = null
     stateCursor = 0
+    globalThis.__DSH_DESKTOP_PICK_DIRECTORY__ = async () => 'D:\\z'
     const probeTree = registration.component({ sessionId: 'session-abc' })
     const probeButton = probeTree.children.find((child) => child?.type === 'button')
     try {
@@ -321,6 +477,7 @@ const run = async () => {
     }
     check('missing remote.commands throws no property error', touched === null, touched?.message)
     delete services.remote
+    delete globalThis.__DSH_DESKTOP_PICK_DIRECTORY__
     services['remote.commands'] = savedCommandsService
   }
 

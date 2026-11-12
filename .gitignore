@@ -12,6 +12,10 @@ node_modules/
 exports/
 export-test/
 
+# 预览产物（由 test/render-panel-preview.mjs 重建，不入库）
+preview/browser-preview.html
+preview/panel.png
+
 # 系统文件
 .DS_Store
 Thumbs.db
